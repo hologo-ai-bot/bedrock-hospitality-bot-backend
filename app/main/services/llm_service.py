@@ -1,18 +1,32 @@
 from main.models.client import Client
 from threading import  Lock
 import boto3
+import botocore
 from botocore.client import BaseClient
+from botocore.exceptions import ClientError
+from langchain_aws import ChatBedrock
+from utils._tokenizers import TokenizerManager
 from flask import current_app
 import json
 import tiktoken
 
+
 class LLMService:
     
-    def __init__(self,  region_name="us-east-1"):
+    def __init__(self ):
         self.locks = {}
-        self.region_name=region_name
+        self.tokenizer_manager = TokenizerManager()
         # self.queues = {}
-
+        
+    def get_token_count(self, text: str) -> int:
+        # Get the tokenizer instance
+        tokenizer = self.tokenizer_manager.sync_get_tokenizer()
+        # Tokenize the input text and get the token IDs
+        encoding = tokenizer.encode(text)  # Use encode() to get token information
+        
+        # Return the number of tokens
+        return len(encoding.ids)  # encoding.ids is a list of token IDs
+    
     def get_lock(self, clientId):
         # print("get_lock")
         if clientId not in self.locks:
@@ -29,85 +43,72 @@ class LLMService:
             client.tkns_used += tkns_used
             client.tkns_remaining -= tkns_used
             client.save()
-            
-    def _return_aws_service_client(self, resource_name='bedrock', run_time=True) -> BaseClient:
-        if resource_name == "bedrock":
-            if run_time:
-                service_client = boto3.client(
-                    service_name="bedrock-agent-runtime",
-                    region_name=self.region_name)
-            else:
-                service_client = boto3.client(
-                    service_name="bedrock-agent",
-                    region_name=self.region_name)
-        elif resource_name == "iam":
-            service_client = boto3.resource("iam")
-    
-        return service_client 
-             
+                   
     def process_request(self, message, clientId):
         try:
-            service_name = current_app.config['SERVICE_NAME']
-            anthropic_version = current_app.config['ANTHROPIC_VERSION']
+            region_name = current_app.config['REGION_NAME']
+            agent_id = current_app.config['AGENT_ID']
+            agent_alias_id = current_app.config['AGENT_ALIAS_ID']
             model_id = current_app.config['MODEL_ID']
-            client = self._return_aws_service_client(run_time=True)
-            bedrock = boto3.client(service_name=service_name)
-            # response = client.retrieve(
-            #     knowledgeBaseId="JSJBCTXXAL",
-            #     retrievalQuery={'text': message},
-            #     retrievalConfiguration={'vectorSearchConfiguration': {'numberOfResults': 2}},
-            #     nextToken='booking'
-            # )
-            # Extract the relevant text from the retrieval response
-            # retrieved_texts = [result['content']['text'] for result in response['retrievalResults']]
-            # combined_retrieved_text = " ".join(retrieved_texts)
-            # print("------------------------------")
-            # print(response)
-            # print("------------------------------")
-            # # Step 2: Combine the retrieved information with the original message
-            # input_message = f"{combined_retrieved_text}\n\nUser query: {message}"
+            session_id = "s03"
 
-            # Step 3: Invoke the bot or model with the combined input
-            service_client = self._return_aws_service_client(resource_name='bedrock', run_time=True)
+            completion = ""
+            traces = []
             
+            config = botocore.config.Config(
+                read_timeout=900,
+                connect_timeout=900,
+                retries={"max_attempts": 0}
+            )            
+            bedrock_client = boto3.client(
+                service_name="bedrock-agent-runtime",
+                region_name=region_name,
+                config=config
+            )
             
-            
-            body = json.dumps({
-                        "max_tokens": 1000,
-                        "messages": [{"role": "user", "content": message}],
-                        "anthropic_version": anthropic_version
-            })
-            
-            response = bedrock.invoke_model(body=body, modelId=model_id)
-            
-            response_body = json.loads(response['body'].read().decode('utf-8'))
-            response_content = response_body.get("content")
-            # response = bedrock.invoke_model(body=body, modelId=model_id)
-            # # print("response : ", response)
-            # # print("---------------------")
-            # response_body = json.loads(response['body'].read().decode('utf-8'))
-            # # print("response body: ", response_body)
-            # # print("---------------------")
-            # response_content = response_body.get("content")
-            # print("response content: ", response_content)
-            # print("---------------------")
-            token_usage = response_body.get("usage").get("input_tokens") + response_body.get("usage").get("output_tokens")
-            self.updateTokenUsage(clientId, token_usage)
-            if isinstance(response_content, list) and len(response_content) > 0:
-                text_content = response_content[0].get("text")
-                return {
-                    "message" : text_content,
-                    "token usage" : token_usage
-                }
-        except Exception as e:  
-            return {"error": str(e)} 
+            llm = ChatBedrock(client=bedrock_client, model_id=model_id)
+            # input_tkns = llm.get_num_tokens(message)
+            input_tkns = self.getTokenCount([{"role": "user", "content": message}])
+            print("tkn in input : ", input_tkns)
+           
+            response = bedrock_client.invoke_agent(
+                agentId=agent_id,
+                agentAliasId=agent_alias_id,
+                sessionId=session_id,
+                inputText=message
+            )
+            print('response : ',response)
+            for event in response.get("completion"):
+                print(event)
+                try:
+                    trace = event["trace"]
+                    traces.append(trace['trace'])
+                except KeyError:
+                    chunk = event["chunk"]
+                    completion = completion + chunk["bytes"].decode()
+                except Exception as e:
+                    print(e)
+
+        except ClientError as e:
+            print(e)
+        
+        print('completion : ',completion)
+        print(type(completion))
+        # output_tkns = llm.get_num_tokens(completion)
+        output_tkns = self.getTokenCount([{"role": "user", "content": completion}])
+        self.updateTokenUsage(clientId, (input_tkns + output_tkns))
+        print("tkn in output : ", output_tkns)
+        return {
+            "message": completion,
+            "token usage" : input_tkns + output_tkns
+        }
 
     def connectModel(self, message, clientId):
         try:    
             remaining_tkns = self.checkRemainingTokens(clientId)
-            # msg_tkn = self.getTokenCount([{"role": "user", "content": message}])
-            # if (msg_tkn * 2 >= remaining_tkns) or (remaining_tkns < 1000):
-            if (remaining_tkns < 1000):
+            msg_tkn = self.getTokenCount([{"role": "user", "content": message}])
+            if (msg_tkn * 2 >= remaining_tkns) or (remaining_tkns < 1000):
+            # if (remaining_tkns < 1000):
                 return {"error": "Remaining tokens are too low. Please recharge to get replies"}
             if remaining_tkns <= 0:
                 return {"error": "Token limit reached"}
@@ -115,7 +116,7 @@ class LLMService:
             return result
         
         except Exception as e: 
-            return {"error": "Unathorized access"}
+            return {"error": str(e)}
         
     def checkRemainingTokens(self, clientId):
         return Client.objects.get(id=clientId).tkns_remaining
@@ -123,7 +124,7 @@ class LLMService:
     def getTokenCount(self, messages):
         """Returns the number of tokens used by a list of messages."""
         try:
-            model = current_app.config['OPENAI_MODEL']
+            model = "gpt-3.5-turbo-0125"
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
